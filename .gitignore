@@ -1,0 +1,17 @@
+keeper.env
+*.log
+state.json
+cursor.json
+hits.json
+found.txt
+foundedIPs.txt
+ranges.txt
+ranges*.txt
+iran_vps_providers_ip_ranges.txt
+ripe.ext
+__pycache__/
+*.pyc
+gui_settings.json
+android/build/
+*.apk
+debug.keystore

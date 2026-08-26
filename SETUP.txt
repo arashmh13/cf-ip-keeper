@@ -1,0 +1,183 @@
+====================================================================
+ CF-IP-KEEPER — Iran Relay Scanner + Auto-DNS Keeper
+ Setup Guide for any Ubuntu VPS (20.04 / 22.04 / 24.04)
+ Archive version: 2026-08-25
+====================================================================
+
+WHAT THIS DOES
+--------------
+Continuously scans Iranian IP subnets for servers that front your
+Cloudflare zone (real TLS handshake + certificate validation against
+your domain + Host header — false positives impossible).
+
+  * Scanner daemon : walks ranges.txt forever (thr=8), finds live
+                     relay IPs -> foundedIPs.txt, state.json, hits.json
+  * Health checker : every 30 min re-probes ALL found IPs + whatever
+                     IP your DNS records currently hold (thr=1);
+                     dead record IP gets replaced automatically
+  * DNS records    : keeps cn.YOURDOMAIN and cn2.YOURDOMAIN (grey
+                     cloud, TTL 60) pointed at two DIFFERENT live relays
+  * Self-learning  : hits.json counts finds per /24; every new scan
+                     cycle starts with the most productive subnets first
+
+FILES IN THIS ARCHIVE
+---------------------
+  cf_ip_keeper.py      checker + Cloudflare DNS writer (stdlib only)
+  scan_loop.py         continuous subnet scanner (stdlib only)
+  scan_daemon.sh       wrapper that keeps the scanner running forever
+  check.sh             wrapper for the 30-min health check (CHECK_ONLY=1)
+  run.sh               single manual run (scanner sample + DNS update)
+  keeper.env           credentials/config  <-- EDIT THIS
+  ranges.txt           4,685 Iranian provider networks (7.3M hosts)
+  iran_vps_providers_ip_ranges.txt   raw source list (49 providers)
+  prepare_ranges.py    rebuild ranges.txt from the raw list (dedupe)
+  cf-ip-scan.service   systemd unit for the scanner daemon
+  vps_setup.sh         one-shot installer (systemd + cron)
+  foundedIPs.txt       seed: relays already found (optional)
+  hits.json            seed: subnet priority scores (optional)
+
+--------------------------------------------------------------------
+STEP-BY-STEP INSTALL ON A NEW UBUNTU VPS
+--------------------------------------------------------------------
+
+STEP 0 — Requirements
+    Ubuntu with root SSH access. Python 3 is preinstalled on all
+    modern Ubuntu. No pip packages needed — everything is stdlib.
+
+STEP 1 — Upload the archive
+    From your PC:
+        scp cf-ip-keeper-archive-YYYYMMDD.tar.gz root@YOUR_VPS_IP:/tmp/
+
+STEP 2 — Extract to /opt
+    ssh root@YOUR_VPS_IP
+        mkdir -p /opt/cf-ip-keeper
+        tar xzf /tmp/cf-ip-keeper-archive-YYYYMMDD.tar.gz \
+            -C /opt/cf-ip-keeper --strip-components=1
+        cd /opt/cf-ip-keeper
+        chmod +x *.sh
+
+STEP 3 — Configure keeper.env
+    nano keeper.env
+
+        CF_DOMAIN=example.com          # your PROXIED domain (SNI/Host of vless)
+        CF_RECORDS=cn.example.com,cn2.example.com
+                                        # grey-cloud records the script owns
+                                        # (comma separated; each gets its OWN IP)
+        CF_TOKEN=xxxx                   # Cloudflare API token (see below)
+        CF_ZONE_ID=xxxxxxxx             # zone ID from dashboard Overview page
+        RANGES_URL=                     # leave empty (ranges.txt is bundled)
+
+    How to make the token (once per Cloudflare account):
+        dash.cloudflare.com -> profile icon -> My Profile ->
+        API Tokens -> Create Token -> template "Edit zone DNS" ->
+        Zone Resources: Include / Specific zone / YOUR ZONE ->
+        Continue -> Create. Copy the token into CF_TOKEN.
+    Zone ID: dash.cloudflare.com -> click your zone -> right sidebar
+        "Zone ID". Copy into CF_ZONE_ID.
+
+    NOTE: records must be (or will be auto-created as) DNS-only /
+    grey-cloud A records. The script creates missing ones itself.
+
+STEP 4 — Quick manual tests (no services installed yet)
+    # 4a. scanner smoke test (~1 min, scans a tiny slice):
+        cd /opt/cf-ip-keeper
+        head -20 ranges.txt > /tmp/test.iplist
+        cp ranges.txt ranges.full.bak && cp /tmp/test.iplist ranges.txt
+        rm -f cursor.json
+        CF_DOMAIN=$(grep CF_DOMAIN keeper.env | cut -d= -f2) \
+        WORKERS=8 PROBE_TIMEOUT=6 timeout 120 python3 -u scan_loop.py
+        cat foundedIPs.txt          # any FOUND lines = healthy
+        cp ranges.full.bak ranges.txt
+
+    # 4b. checker dry run (must NOT touch DNS):
+        set -a; source keeper.env; set +a
+        WORKERS=8 PROBE_TIMEOUT=6 python3 cf_ip_keeper.py --dry
+        # expect: "probing N IPs ... alive" and "[dry] would ensure ..."
+        # (N can be 0 on first run before the scanner finds anything)
+
+STEP 5 — Install as services (scanner + 30-min checker)
+        bash vps_setup.sh
+
+    This:
+      * installs /etc/systemd/system/cf-ip-scan.service (auto-start
+        on boot, auto-restart on crash)
+      * installs crontab line: */30 * * * * cd /opt/cf-ip-keeper &&
+        bash check.sh >> checker.log 2>&1
+      * resets stale state and starts everything
+
+STEP 6 — Verify
+        systemctl status cf-ip-scan         # want: active (running)
+        tail -f /opt/cf-ip-keeper/scanner.log   # watch progress + FOUND lines
+        cat /opt/cf-ip-keeper/cursor.json       # position grows over time
+        crontab -l | grep cf-ip                 # cron line present
+        nslookup cn.yourdomain 1.1.1.1          # after first finds+checker,
+        nslookup cn2.yourdomain 1.1.1.1         # these return live relay IPs
+
+--------------------------------------------------------------------
+DAILY OPERATION
+--------------------------------------------------------------------
+    Progress        : tail -f /opt/cf-ip-keeper/scanner.log
+    Found relays    : sort -k2 -n /opt/cf-ip-keeper/foundedIPs.txt | head
+    Checker actions : tail /opt/cf-ip-keeper/checker.log
+    Subnet ranking  : python3 -c "import json;h=json.load(open('/opt/cf-ip-keeper/hits.json'));[print(v,k) for k,v in sorted(h.items(),key=lambda x:-x[1])[:20]]"
+    Restart scanner : systemctl restart cf-ip-scan
+    Stop everything : systemctl stop cf-ip-scan && crontab -l | grep -v cf-ip | crontab -
+
+TIMELINE EXPECTATIONS
+---------------------
+    Full cycle over 4,685 nets @ thr=8 on a small VPS: roughly 2-4 days.
+    You do NOT need to wait for a full cycle — finds appear within the
+    first minutes-hours (priority ordering puts productive /24s first
+    after the first cycle). First DNS switch happens at the next
+    checker tick (every 30 min) once >=1 relay is found.
+
+MULTI-VPS NOTES
+---------------
+    * SCANNER: safe to install on MANY VPSes simultaneously — more
+      vantage points = more finds. Each keeps its own local state.
+    * CHECKER/DNS WRITER: install the CRON part on ONE primary VPS
+      only. Two checkers measuring from different networks may disagree
+      on "best" IP and cause DNS flapping.
+      To skip the checker on extra boxes: don't run vps_setup.sh;
+      instead just:
+        systemctl enable --now /opt/cf-ip-keeper/cf-ip-scan.service
+      (after copying the service file into /etc/systemd/system/ and
+      running systemctl daemon-reload).
+
+UPDATING THE RANGE LIST
+-----------------------
+    Replace iran_vps_providers_ip_ranges.txt with a fresh export, then:
+        python3 prepare_ranges.py iran_vps_providers_ip_ranges.txt ranges.txt
+        rm -f cursor.json          # start the walk from the top
+        systemctl restart cf-ip-scan
+
+TROUBLESHOOTING
+---------------
+    * scanner.log empty but service active:
+        older versions buffered stdout; current scan_daemon.sh already
+        runs python3 -u. If you still see nothing:
+        systemctl restart cf-ip-scan
+    * no FOUND lines for hours:
+        normal early on (hit-rate ~0.1-1%). Check cursor.json advances;
+        confirm with the smoke test in STEP 4a.
+    * "Connection closed by ... port 22" when SSHing a lot:
+        sshd rate limiting; wait a minute between connections.
+    * checker log shows "no free alive relay":
+        fewer live relays than records; scanner needs more time.
+    * wrong country results: ensure ranges.txt contains IR networks
+      only (rebuild with prepare_ranges.py).
+
+SECURITY
+--------
+    * keeper.env holds a real API token — keep this archive PRIVATE.
+    * Token scope is DNS-Edit on ONE zone only; revoke/rotate anytime
+      at dash.cloudflare.com -> My Profile -> API Tokens.
+    * chmod 600 /opt/cf-ip-keeper/keeper.env on the VPS.
+
+UNINSTALL
+---------
+        systemctl disable --now cf-ip-scan
+        rm /etc/systemd/system/cf-ip-scan.service
+        crontab -l | grep -v cf-ip | crontab -
+        rm -rf /opt/cf-ip-keeper
+====================================================================
