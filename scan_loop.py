@@ -1,41 +1,67 @@
-"""Continuous subnet scanner with learned priority.
-- walks ranges.txt exhaustively, resumable cursor, WORKERS<=8
-- records hits per /24 in hits.json
+"""Continuous subnet scanner with learned priority and section support.
+- walks ranges[_<section>].txt exhaustively, resumable cursor
+- records hits per /24 in hits[_<section>].json
 - each new cycle sorts nets: most-productive /24s FIRST, dead ones last
-- appends finds to foundedIPs.txt + shared state.json"""
-import asyncio, ipaddress, json, os, ssl, time
+- appends finds to foundedIPs[_<section>].txt + shared state[_<section>].json"""
+import asyncio, ipaddress, json, os, ssl, sys, time
 
-BASE    = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.abspath(__file__))
+SECTION = os.environ.get("SECTION", "")
+for idx, arg in enumerate(sys.argv):
+    if arg == "--section" and idx + 1 < len(sys.argv):
+        SECTION = sys.argv[idx + 1]
+
+def get_filename(base_name, ext="txt"):
+    if not SECTION or SECTION.lower() in ("default", "main"):
+        return os.path.join(BASE, f"{base_name}.{ext}")
+    return os.path.join(BASE, f"{base_name}_{SECTION}.{ext}")
+
 WORKERS = int(os.environ.get("WORKERS", 8))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", 6))
-DOMAIN  = os.environ["CF_DOMAIN"]
-RANGES  = os.path.join(BASE, "ranges.txt")
-FOUND   = os.path.join(BASE, "foundedIPs.txt")
-STATE   = os.path.join(BASE, "state.json")
-CURSOR  = os.path.join(BASE, "cursor.json")
-HITS    = os.path.join(BASE, "hits.json")
+DOMAIN  = os.environ.get("CF_DOMAIN", "")
+RANGES  = get_filename("ranges", "txt")
+FOUND   = get_filename("foundedIPs", "txt")
+STATE   = get_filename("state", "json")
+CURSOR  = get_filename("cursor", "json")
+HITS    = get_filename("hits", "json")
 CTX     = ssl.create_default_context()
 
-def log(m): print(time.strftime("%F %T"), m, flush=True)
+def log(m):
+    prefix = f"[{SECTION}] " if SECTION else ""
+    print(time.strftime("%F %T"), f"{prefix}{m}", flush=True)
 
 def _load(p):
     if os.path.exists(p):
-        with open(p) as f: return json.load(f)
+        try:
+            with open(p, encoding="utf-8") as f: return json.load(f)
+        except Exception:
+            return None
     return None
 
 def _save(p, d):
     tmp = p + ".tmp"
-    with open(tmp, "w") as f: json.dump(d, f)
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(d, f)
     os.replace(tmp, p)
 
 def nets():
+    rpath = RANGES
+    if not os.path.exists(rpath):
+        default_p = os.path.join(BASE, "ranges.txt")
+        if os.path.exists(default_p):
+            rpath = default_p
+        else:
+            return []
     out = []
-    for ln in open(RANGES):
-        ln = ln.split("#")[0].strip()
-        if ln:
-            n = ipaddress.ip_network(ln, strict=False)
-            if n.num_addresses >= 64:
-                out.append(n)
+    with open(rpath, encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.split("#")[0].strip()
+            if ln:
+                try:
+                    n = ipaddress.ip_network(ln, strict=False)
+                    if n.num_addresses >= 4:
+                        out.append(n)
+                except ValueError:
+                    pass
     return out
 
 def slash24s(net):
@@ -73,20 +99,36 @@ async def probe(ip, sem):
             return None
 
 async def run_cycle():
+    if not DOMAIN:
+        log("ERROR: CF_DOMAIN is required")
+        sys.exit(1)
     sem = asyncio.Semaphore(WORKERS)
     allnets = prioritize(nets())
+    if not allnets:
+        log(f"No valid networks found in {RANGES}")
+        return
     cur = _load(CURSOR) or {"i": 0, "j": 0}
-    log(f"start: {len(allnets)} nets, resume at #{cur['i']} (+{cur['j']})")
+    log(f"start: {len(allnets)} nets, resume at #{cur['i']} (+{cur['j']}) [workers={WORKERS}, timeout={TIMEOUT}s]")
     total = 0
-    for i in range(cur["i"], len(allnets)):
+    for i in range(cur.get("i", 0), len(allnets)):
         net = allnets[i]
         chunks = []
         for s24 in slash24s(net):
             hosts = [str(h) for h in s24.hosts()]
-            for j in range(0, len(hosts), 200):
-                chunks.append(hosts[j:j + 200])
-        j0 = cur["j"]
-        for k in range(j0 // 200, len(chunks)):
+            step = max(WORKERS * 25, 100)
+            for j in range(0, len(hosts), step):
+                chunks.append(hosts[j:j + step])
+        if not chunks:
+            # For tiny blocks /31, /32
+            chunks = [[str(ip) for ip in net.hosts()] or [str(net.network_address)]]
+
+        j0 = cur.get("j", 0)
+        start_k = 0
+        if i == cur.get("i", 0) and j0 > 0:
+            step = max(WORKERS * 25, 100)
+            start_k = min(j0 // step, len(chunks))
+
+        for k in range(start_k, len(chunks)):
             chunk = chunks[k]
             res = await asyncio.gather(*(probe(ip, sem) for ip in chunk))
             hits_now = [x for x in res if x]
@@ -94,7 +136,7 @@ async def run_cycle():
                 st = _load(STATE) or {}
                 hh = _load(HITS) or {}
                 now = time.time()
-                with open(FOUND, "a") as f:
+                with open(FOUND, "a", encoding="utf-8") as f:
                     for ip, ms in sorted(hits_now, key=lambda x: x[1]):
                         f.write(f"{ip} {ms}\n")
                         log(f"FOUND {ip} {ms}ms")
@@ -103,7 +145,8 @@ async def run_cycle():
                         hh[s24] = hh.get(s24, 0) + 1
                 _save(STATE, st)
                 _save(HITS, hh)
-            cur = {"i": i, "j": (k + 1) * 200}
+            step = max(WORKERS * 25, 100)
+            cur = {"i": i, "j": (k + 1) * step}
             _save(CURSOR, cur)
             total += len(hits_now)
         cur = {"i": i + 1, "j": 0}

@@ -1,27 +1,45 @@
 #!/usr/bin/env python3
-"""Keeps a grey-cloud A record pointed at a live CN relay IP that fronts your Cloudflare zone.
-VLESS address = RECORD (grey cloud), SNI/Host = DOMAIN. Stdlib only, Python 3.10+."""
+"""Keeps grey-cloud A records pointed at live relay IPs that front your Cloudflare zone.
+Supports multi-section namespacing via SECTION env var or --section arg.
+VLESS address = RECORDS (grey cloud), SNI/Host = DOMAIN. Stdlib only, Python 3.10+."""
 import asyncio, ipaddress, json, os, random, ssl, sys, time, urllib.request
 
-BASE   = os.path.dirname(os.path.abspath(__file__))
-DRY    = "--dry" in sys.argv
-DOMAIN = os.environ["CF_DOMAIN"]   # real proxied domain (vless sni + host)
+BASE = os.path.dirname(os.path.abspath(__file__))
+DRY = "--dry" in sys.argv
+
+# Extract section name if passed as --section <name>
+SECTION = os.environ.get("SECTION", "")
+for idx, arg in enumerate(sys.argv):
+    if arg == "--section" and idx + 1 < len(sys.argv):
+        SECTION = sys.argv[idx + 1]
+
+def get_filename(base_name, ext="txt"):
+    """Namespace file by section if section is provided."""
+    if not SECTION or SECTION.lower() in ("default", "main"):
+        return os.path.join(BASE, f"{base_name}.{ext}")
+    return os.path.join(BASE, f"{base_name}_{SECTION}.{ext}")
+
+DOMAIN = os.environ.get("CF_DOMAIN", "")   # real proxied domain (vless sni + host)
 RECORD = os.environ.get("CF_RECORD", "")   # legacy single-record name
 # backup subdomains: comma-separated, each gets its OWN distinct relay
 RECORDS = [r.strip() for r in os.environ.get("CF_RECORDS", RECORD).split(",") if r.strip()]
-TOKEN  = os.environ["CF_TOKEN"]
-ZONE   = os.environ["CF_ZONE_ID"]
-PORT, TIMEOUT  = 443, float(os.environ.get("PROBE_TIMEOUT", 2.0))
+TOKEN  = os.environ.get("CF_TOKEN", "")
+ZONE   = os.environ.get("CF_ZONE_ID", "")
+PORT, TIMEOUT  = 443, float(os.environ.get("PROBE_TIMEOUT", 6.0))
 PROBE_BUDGET   = int(os.environ.get("PROBE_BUDGET", 600))
-WORKERS        = int(os.environ.get("WORKERS", 200))
+WORKERS        = int(os.environ.get("WORKERS", 8))
 MARGIN_MS      = int(os.environ.get("MARGIN_MS", 30))
 KEEP           = 300
-STATE  = os.path.join(BASE, "state.json")
+STATE  = get_filename("state", "json")
 CTX    = ssl.create_default_context()   # cert verification ON: probe only passes if IP fronts YOUR domain's cert
 
-def log(m): print(time.strftime("%F %T"), m, flush=True)
+def log(m):
+    prefix = f"[{SECTION}] " if SECTION else ""
+    print(time.strftime("%F %T"), f"{prefix}{m}", flush=True)
 
 def cf(method, path, body=None):
+    if not TOKEN:
+        raise ValueError("CF_TOKEN is not set")
     req = urllib.request.Request(
         f"https://api.cloudflare.com/client/v4{path}",
         data=json.dumps(body).encode() if body else None,
@@ -34,27 +52,37 @@ def cf(method, path, body=None):
     return d["result"]
 
 def hosts_of(n):
-    # ponytail: ranges > /20 get 256 random draws instead of full enumeration; split big blocks in ranges.txt if you want exhaustive
     if n.num_addresses <= 4096:
         return [str(h) for h in n.hosts()]
     base = int(n.network_address)
     return [str(ipaddress.ip_address(base + random.randrange(1, n.num_addresses - 1))) for _ in range(256)]
 
 def load_ranges():
+    rpath = get_filename("ranges", "txt")
+    if not os.path.exists(rpath):
+        # fallback to default ranges.txt if section-specific not found yet
+        default_p = os.path.join(BASE, "ranges.txt")
+        if os.path.exists(default_p):
+            rpath = default_p
+        else:
+            return []
     nets = []
-    with open(os.path.join(BASE, "ranges.txt")) as f:
+    with open(rpath, encoding="utf-8", errors="ignore") as f:
         for ln in f:
             ln = ln.split("#")[0].strip()
             if ln:
-                nets.append(ipaddress.ip_network(ln, strict=False))
+                try:
+                    nets.append(ipaddress.ip_network(ln, strict=False))
+                except ValueError:
+                    pass
     return nets
 
-RANGES_URL = os.environ.get("RANGES_URL", "")   # e.g. https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt
+RANGES_URL = os.environ.get("RANGES_URL", "")
 
 def ensure_ranges():
-    p = os.path.join(BASE, "ranges.txt")
+    p = get_filename("ranges", "txt")
     if RANGES_URL and (not os.path.exists(p) or time.time() - os.path.getmtime(p) > 604800):
-        req = urllib.request.Request(RANGES_URL, headers={"User-Agent": "curl/8.5"})  # some CDNs 403 the default python UA
+        req = urllib.request.Request(RANGES_URL, headers={"User-Agent": "curl/8.5"})
         with urllib.request.urlopen(req, timeout=30) as r, open(p, "wb") as f:
             f.write(r.read())
     return p
@@ -89,36 +117,51 @@ async def scan(ips):
 
 def save(state):
     tmp = STATE + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(dict(sorted(state.items(), key=lambda kv: kv[1]["ms"])), f, indent=1)
     os.replace(tmp, STATE)
 
 def main():
+    if not DOMAIN:
+        log("ERROR: CF_DOMAIN is required")
+        sys.exit(1)
+    if not RECORDS:
+        log("ERROR: CF_RECORDS is required")
+        sys.exit(1)
+
     state = {}
     if os.path.exists(STATE):
-        with open(STATE) as f: state = json.load(f)
+        try:
+            with open(STATE, encoding="utf-8") as f: state = json.load(f)
+        except Exception: pass
     now = time.time()
-    state = {ip: v for ip, v in state.items() if now - v["ts"] < 86400}
+    state = {ip: v for ip, v in state.items() if now - v.get("ts", 0) < 86400}
 
     if RANGES_URL and "--dry" not in sys.argv:
-        ensure_ranges()                  # auto-download / weekly refresh
-    known = set(state.keys())            # all found relays from last 24h
-    ffound = os.path.join(BASE, "foundedIPs.txt")
-    if os.path.exists(ffound):           # every IP the scanner ever found stays under health-check
-        for ln in open(ffound):
-            ip = ln.split()[0]
-            if ip.count(".") == 3:
-                known.add(ip)
-    if os.environ.get("CHECK_ONLY") != "1":     # checker mode: skip subnet sampling
+        ensure_ranges()
+    known = set(state.keys())
+    ffound = get_filename("foundedIPs", "txt")
+    if os.path.exists(ffound):
+        for ln in open(ffound, encoding="utf-8", errors="ignore"):
+            parts = ln.split()
+            if parts:
+                ip = parts[0]
+                if ip.count(".") == 3:
+                    known.add(ip)
+    if os.environ.get("CHECK_ONLY") != "1":
         known |= set(sample_hosts(load_ranges()))
-    range_ips = known
+    range_ips = set(known)
     ips = set(known)
-    rec = None
-    if not DRY:                          # dry mode never touches the API
-        for name in RECORDS:             # health-check every record's current IP
-            recs = cf("GET", f"/zones/{ZONE}/dns_records?type=A&name={name}")
-            if recs:
-                ips.add(recs[0]["content"])
+    
+    if not DRY and ZONE and TOKEN:
+        for name in RECORDS:
+            try:
+                recs = cf("GET", f"/zones/{ZONE}/dns_records?type=A&name={name}")
+                if recs:
+                    ips.add(recs[0]["content"])
+            except Exception as e:
+                log(f"warning: failed to fetch current record {name}: {e}")
+
     log(f"probing {len(ips)} IPs{' (dry)' if DRY else ''} ...")
     fresh = asyncio.run(scan(sorted(ips)))
     log(f"{len(fresh)} alive")
@@ -128,12 +171,17 @@ def main():
 
     if not fresh:
         log("no alive relay found; DNS untouched"); return
-    # prefer relays found in ranges; current record IP only as last-resort fallback
+
     relay_fresh = {ip: ms for ip, ms in fresh.items() if ip in range_ips}
     pool = relay_fresh or fresh
-    used = set()                             # each record gets a DISTINCT relay
+    used = set()
     for name in RECORDS:
-        recs = DRY and [] or cf("GET", f"/zones/{ZONE}/dns_records?type=A&name={name}")
+        recs = []
+        if not DRY and ZONE and TOKEN:
+            try:
+                recs = cf("GET", f"/zones/{ZONE}/dns_records?type=A&name={name}")
+            except Exception as e:
+                log(f"error querying {name}: {e}")
         rec = recs[0] if recs else None
         cur = rec["content"] if rec else None
         cand = {ip: ms for ip, ms in pool.items() if ip not in used}
@@ -149,7 +197,7 @@ def main():
             cf("POST", f"/zones/{ZONE}/dns_records",
                {"type": "A", "name": name, "content": best, "ttl": 60, "proxied": False})
             log(f"created {name} -> {best} ({fresh[best]}ms)")
-        elif not cur_is_relay:                   # placeholder/edge in record -> real relay
+        elif not cur_is_relay:
             cf("PUT", f"/zones/{ZONE}/dns_records/{rec['id']}",
                {"type": "A", "name": name, "content": best, "ttl": 60, "proxied": False})
             log(f"switched {name}: {cur} ({cur_ms}ms) -> {best} ({fresh[best]}ms)")
@@ -160,7 +208,7 @@ def main():
         else:
             log(f"keeping {name}={cur} ({cur_ms}ms); best alt {best} {fresh[best]}ms")
         if cur and cur_ms is not None:
-            used.add(cur)                # keep current assignment distinct from the next record
+            used.add(cur)
         used.add(best)
 
 if __name__ == "__main__":
