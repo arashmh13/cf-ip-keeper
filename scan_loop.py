@@ -18,7 +18,7 @@ def get_filename(base_name, ext="txt"):
 
 WORKERS = int(os.environ.get("WORKERS", 8))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", 6))
-DOMAIN  = os.environ.get("CF_DOMAIN", "")
+DOMAIN  = os.environ.get("CF_DOMAIN", "").strip()
 RANGES  = get_filename("ranges", "txt")
 FOUND   = get_filename("foundedIPs", "txt")
 STATE   = get_filename("state", "json")

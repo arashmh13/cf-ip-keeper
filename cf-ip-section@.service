@@ -1,0 +1,13 @@
+[Unit]
+Description=CF IP Keeper section %i
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/cf-ip-keeper
+ExecStart=/bin/bash /opt/cf-ip-keeper/run_section.sh %i
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

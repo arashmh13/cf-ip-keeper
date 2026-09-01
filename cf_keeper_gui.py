@@ -83,7 +83,7 @@ def save_config(cfg):
         if first_sec:
             sec_rec = cfg["sections"][first_sec].get("records", "")
             lines.append(f"CF_RECORDS={sec_rec}")
-        with open(LEGACY_ENV + ".tmp", "w", encoding="utf-8") as f:
+        with open(LEGACY_ENV + ".tmp", "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
         os.replace(LEGACY_ENV + ".tmp", LEGACY_ENV)
     except Exception:

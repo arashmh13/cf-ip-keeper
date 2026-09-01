@@ -19,12 +19,12 @@ def get_filename(base_name, ext="txt"):
         return os.path.join(BASE, f"{base_name}.{ext}")
     return os.path.join(BASE, f"{base_name}_{SECTION}.{ext}")
 
-DOMAIN = os.environ.get("CF_DOMAIN", "")   # real proxied domain (vless sni + host)
-RECORD = os.environ.get("CF_RECORD", "")   # legacy single-record name
+DOMAIN = os.environ.get("CF_DOMAIN", "").strip()   # real proxied domain (vless sni + host)
+RECORD = os.environ.get("CF_RECORD", "").strip()   # legacy single-record name
 # backup subdomains: comma-separated, each gets its OWN distinct relay
 RECORDS = [r.strip() for r in os.environ.get("CF_RECORDS", RECORD).split(",") if r.strip()]
-TOKEN  = os.environ.get("CF_TOKEN", "")
-ZONE   = os.environ.get("CF_ZONE_ID", "")
+TOKEN  = os.environ.get("CF_TOKEN", "").strip()
+ZONE   = os.environ.get("CF_ZONE_ID", "").strip()
 PORT, TIMEOUT  = 443, float(os.environ.get("PROBE_TIMEOUT", 6.0))
 PROBE_BUDGET   = int(os.environ.get("PROBE_BUDGET", 600))
 WORKERS        = int(os.environ.get("WORKERS", 8))
