@@ -190,6 +190,7 @@ def main():
         best = min(cand, key=cand.get)
         cur_ms = fresh.get(cur)
         cur_is_relay = cur in range_ips
+        dup_cur = cur in used   # another record already claimed this IP this run
         if DRY:
             log(f"[dry] would ensure {name} -> {best} ({fresh[best]}ms); current={cur} ({cur_ms})")
             used.add(best); continue
@@ -197,14 +198,13 @@ def main():
             cf("POST", f"/zones/{ZONE}/dns_records",
                {"type": "A", "name": name, "content": best, "ttl": 60, "proxied": False})
             log(f"created {name} -> {best} ({fresh[best]}ms)")
-        elif not cur_is_relay:
+        elif not cur_is_relay or cur_ms is None or dup_cur or fresh[best] + MARGIN_MS < cur_ms:
             cf("PUT", f"/zones/{ZONE}/dns_records/{rec['id']}",
                {"type": "A", "name": name, "content": best, "ttl": 60, "proxied": False})
-            log(f"switched {name}: {cur} ({cur_ms}ms) -> {best} ({fresh[best]}ms)")
-        elif cur_ms is None or fresh[best] + MARGIN_MS < cur_ms:
-            cf("PUT", f"/zones/{ZONE}/dns_records/{rec['id']}",
-               {"type": "A", "name": name, "content": best, "ttl": 60, "proxied": False})
-            log(f"switched {name}: {cur} ({cur_ms}ms) -> {best} ({fresh[best]}ms)")
+            why = ("dead" if cur_ms is None else
+                   "duplicate" if dup_cur else
+                   "not-a-relay" if not cur_is_relay else "faster")
+            log(f"switched {name}: {cur} ({cur_ms}ms) -> {best} ({fresh[best]}ms) [{why}]")
         else:
             log(f"keeping {name}={cur} ({cur_ms}ms); best alt {best} {fresh[best]}ms")
         if cur and cur_ms is not None:
