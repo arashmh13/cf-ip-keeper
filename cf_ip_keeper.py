@@ -119,6 +119,8 @@ def save(state):
     tmp = STATE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(dict(sorted(state.items(), key=lambda kv: kv[1]["ms"])), f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())          # power-loss safe
     os.replace(tmp, STATE)
 
 def main():

@@ -40,8 +40,15 @@ def _load(p):
 
 def _save(p, d):
     tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(d, f)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+        f.flush()
+        os.fsync(f.fileno())          # power-loss safe: data reaches disk
     os.replace(tmp, p)
+    # fsync the directory so the rename itself survives power loss
+    dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
 
 def nets():
     rpath = RANGES
@@ -143,6 +150,8 @@ async def run_cycle():
                         st[ip] = {"ms": ms, "ts": now}
                         s24 = str(ipaddress.ip_network(f"{ip}/24", strict=False))
                         hh[s24] = hh.get(s24, 0) + 1
+                    f.flush()
+                    os.fsync(f.fileno())   # power-loss safe: found IPs never lost
                 _save(STATE, st)
                 _save(HITS, hh)
             step = max(WORKERS * 25, 100)
