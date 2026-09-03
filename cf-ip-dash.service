@@ -1,0 +1,12 @@
+[Unit]
+Description=CF IP Keeper dashboard (glass control tower)
+After=network.target
+
+[Service]
+WorkingDirectory=/DATA/cf-ip-keeper
+ExecStart=/usr/bin/python3 /DATA/cf-ip-keeper/dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

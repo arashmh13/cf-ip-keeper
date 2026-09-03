@@ -5,4 +5,4 @@ Description=CF IP Keeper - ALL sections health check (every 30 min)
 Type=oneshot
 WorkingDirectory=/DATA/cf-ip-keeper
 ExecStart=/bin/bash /DATA/cf-ip-keeper/zima_keeper_pass.sh
-TimeoutStartSec=25min
+TimeoutStartSec=40min
