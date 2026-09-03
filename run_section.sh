@@ -1,5 +1,8 @@
 #!/bin/bash
-# Run one section: continuous scanner (background) + keeper loop (every N min)
+# Run one section: continuous scanner only.
+# DNS keeping for ALL sections is centralized in the 30-min systemd timer
+# (cf-ip-check.service -> zima_keeper_pass.sh) so there is exactly ONE
+# DNS writer cadence: every 30 minutes, recheck found IPs + live records.
 # Usage: bash run_section.sh <SectionName>
 SEC="$1"
 cd "$(dirname "$0")" || exit 1
@@ -13,23 +16,15 @@ CFG_OUT=$("$PY" -c "
 import json, sys
 cfg = json.load(open('sections_config.json'))
 s = cfg['sections'].get(sys.argv[1], {})
-print(s.get('records',''), s.get('workers',2), s.get('check_interval_min',60), s.get('margin_ms',30), s.get('probe_timeout',6))
+print(s.get('records',''), s.get('workers',2), s.get('margin_ms',30), s.get('probe_timeout',6))
 " "$SEC")
-read -r RECORDS WORKERS INTERVAL MARGIN TIMEOUT <<<"$CFG_OUT"
+read -r RECORDS WORKERS MARGIN TIMEOUT <<<"$CFG_OUT"
 
 export SECTION="$SEC" CF_RECORDS="$RECORDS" WORKERS="$WORKERS" MARGIN_MS="$MARGIN" PROBE_TIMEOUT="$TIMEOUT"
-echo "$(date -Is) [$SEC] launch: records=$RECORDS workers=$WORKERS interval=${INTERVAL}min"
+echo "$(date -Is) [$SEC] launch scanner: workers=$WORKERS"
 
-# continuous scanner
+# continuous scanner (keeper loop removed: see zima_keeper_pass.sh + cf-ip-check.timer)
 "$PY" -u scan_loop.py >> "scanner_$SEC.log" 2>&1 &
 SCAN_PID=$!
-
-# keeper loop: check every INTERVAL minutes (creates/updates this section's records)
-while true; do
-  sleep $((INTERVAL * 60))
-  CHECK_ONLY=1 WORKERS=1 "$PY" -u cf_ip_keeper.py >> "checker_$SEC.log" 2>&1
-done &
-KEEP_PID=$!
-
-trap "kill $SCAN_PID $KEEP_PID 2>/dev/null" EXIT
+trap "kill $SCAN_PID 2>/dev/null" EXIT
 wait
