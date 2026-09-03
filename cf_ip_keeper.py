@@ -30,6 +30,9 @@ PROBE_BUDGET   = int(os.environ.get("PROBE_BUDGET", 600))
 WORKERS        = int(os.environ.get("WORKERS", 8))
 MARGIN_MS      = int(os.environ.get("MARGIN_MS", 30))
 KEEP           = 300
+# Ground truth: validate on the REAL VLESS path, not just /. Some edges serve /
+# with 2xx but 403 the xhttp path — those are useless for the client.
+VLESS_PATH     = os.environ.get("CF_VLESS_PATH", "/").strip()
 STATE  = get_filename("state", "json")
 CTX    = ssl.create_default_context()   # cert verification ON: probe only passes if IP fronts YOUR domain's cert
 IPV6_API = os.environ.get("CF_API_FORCE_IPV6", "1").strip() not in ("0", "false", "no")
@@ -122,7 +125,7 @@ async def probe(ip, sem):
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(ip, PORT, ssl=CTX, server_hostname=DOMAIN), TIMEOUT)
-            w.write(f"GET / HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
+            w.write(f"GET {VLESS_PATH} HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
             await w.drain()
             line = await asyncio.wait_for(r.readline(), TIMEOUT)
             ms = round((time.perf_counter() - t0) * 1000)

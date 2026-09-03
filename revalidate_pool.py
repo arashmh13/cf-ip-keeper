@@ -21,6 +21,7 @@ assert DOMAIN, "CF_DOMAIN missing from keeper.env"
 WORKERS = 8        # home network: >8 concurrent TLS probes false-kill
 TIMEOUT = 6.0
 CTX = ssl.create_default_context()
+VLESS_PATH = env.get("CF_VLESS_PATH", "/").strip() or "/"
 
 def log(m):
     print(time.strftime("%F %T"), m, flush=True)
@@ -36,7 +37,7 @@ async def probe(ip, sem):
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(ip, 443, ssl=CTX, server_hostname=DOMAIN), TIMEOUT)
-            w.write(f"GET / HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
+            w.write(f"GET {VLESS_PATH} HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
             await w.drain()
             line = await asyncio.wait_for(r.readline(), TIMEOUT)
             ms = round((time.perf_counter() - t0) * 1000)

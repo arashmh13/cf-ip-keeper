@@ -25,6 +25,9 @@ STATE   = get_filename("state", "json")
 CURSOR  = get_filename("cursor", "json")
 HITS    = get_filename("hits", "json")
 CTX     = ssl.create_default_context()
+# Ground truth: validate on the REAL VLESS path, not just /. Some edges serve /
+# with 2xx but 403 the xhttp path — those are useless for the client.
+VLESS_PATH = os.environ.get("CF_VLESS_PATH", "/").strip()
 
 def log(m):
     prefix = f"[{SECTION}] " if SECTION else ""
@@ -94,7 +97,7 @@ async def probe(ip, sem):
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection(ip, 443, ssl=CTX, server_hostname=DOMAIN), TIMEOUT)
-            w.write(f"GET / HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
+            w.write(f"GET {VLESS_PATH} HTTP/1.1\r\nHost: {DOMAIN}\r\nConnection: close\r\n\r\n".encode())
             await w.drain()
             line = await asyncio.wait_for(r.readline(), TIMEOUT)
             ms = round((time.perf_counter() - t0) * 1000)
