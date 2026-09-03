@@ -29,9 +29,33 @@ VLESS client ──> cn.example.com (grey A, TTL 60)  ──> live relay IP :443
 
 | Version | Location | Needs |
 |---|---|---|
-| Linux (VPS) | `scan_daemon.sh` + cron | Python 3 (stdlib only) |
+| Linux (VPS / ZimaOS / Ubuntu) | `scan_daemon.sh` / `run_section.sh` + systemd | Python 3 (stdlib only) |
+| Web dashboard | `dashboard.py` (:8787) | Python 3 (stdlib only) — works on any Linux + WSL |
 | Windows GUI | `cf_keeper_gui.py` | Python + tkinter (stdlib only) |
 | Android | see Releases | none (APK) |
+
+## Web dashboard (any Linux, port 8787)
+
+Real-time glass UI: section cards (scan cursor, hot /24s, found pool, current
+DNS record + latency, service health), live SSE log viewer for every scanner
+and the keeper, one-click start/stop/restart per section, EN/FA bilingual.
+Zero dependencies — pure stdlib, reads the project's state files directly.
+
+```bash
+# quick manual run (from the project dir)
+python3 dashboard.py          # http://<host>:8787/
+
+# or install as a boot service (Ubuntu / Debian / ZimaOS):
+sudo bash install_dashboard.sh /opt/cf-ip-keeper
+```
+
+- `install_dashboard.sh` installs `cf-ip-dash.service` (enabled at boot,
+  restart-on-crash) and an optional passwordless-sudoers rule so the UI's
+  control buttons work for `cf-ip-*` units only — nothing else.
+- Works even where `tail -F` is missing (pure-Python streaming fallback) and
+  degrades gracefully where systemd/sudo is unavailable.
+- Files it reads: `sections_config.json`, `cursor_*/state_*/hits_*/ranges_*`,
+  `scanner_*.log`, `checker_*.log`. It never reads or exposes `keeper.env`.
 
 ## Quick start — Linux VPS
 
@@ -77,10 +101,12 @@ An IP counts only if:
 1. TCP 443 connects,
 2. TLS handshake succeeds **and the certificate validates for your
    fronting domain** (default OS trust store),
-3. an HTTP request with your domain as Host returns any HTTP response.
+3. an HTTP request with your domain as Host, **on the real VLESS path**
+   (`CF_VLESS_PATH`, default `/`), returns **HTTP 2xx**.
 
-Random open-443 hosts can't false-positive; the probe is exactly what your
-VLESS client will experience.
+Cloudflare edges that present a valid cert but refuse to proxy your zone
+(403 "error code: 1034" — Edge IP Restricted) are rejected automatically;
+the probe is exactly what your VLESS client will experience.
 
 ## Configuration reference (`keeper.env`)
 

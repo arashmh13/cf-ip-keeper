@@ -1,6 +1,9 @@
 """CF IP Keeper — live monitoring dashboard (zero dependencies, stdlib only).
-Serves on :8787 — glass UI, SSE live logs, per-section control, EN/FA bilingual.
-Runs on ZimaOS from /DATA/cf-ip-keeper alongside the scanner services.
+Serves on :8787 (override with DASH_PORT) — glass UI, SSE live logs,
+per-section control, EN/FA bilingual.
+Works on any Linux (Ubuntu/Debian/ZimaOS) and even bare Windows Python:
+- `tail -F` used for live streaming when available, pure-Python polling otherwise
+- systemctl controls degrade gracefully when sudo/systemd are unavailable
 """
 import json, os, re, subprocess, threading, time, html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -151,9 +154,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, b'{"error":"bad action"}')
         if action == "check": action = "start"
         out = sh("sudo", "-n", "systemctl", action, unit)
-        ok = subprocess.run(["sudo", "-n", "systemctl", "is-active", unit],
-                            capture_output=True, text=True).stdout.strip()
-        self._send(200, json.dumps({"ok": ok == "active", "state": ok, "out": out}).encode())
+        ok = sh("sudo", "-n", "systemctl", "is-active", unit)
+        self._send(200, json.dumps({"ok": ok == "active", "state": ok or "unavailable", "out": out}).encode())
 
     def stream_sse(self, q):
         name = (q.get("file") or ["scanner.log"])[0]
@@ -169,16 +171,36 @@ class Handler(BaseHTTPRequestHandler):
             for ln in tail_lines(path, 150):
                 self.wfile.write(f"data: {json.dumps(ln)}\n\n".encode())
             self.wfile.flush()
-            p = subprocess.Popen(["tail", "-n", "0", "-F", path],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            # prefer `tail -F` when available (Linux/macOS/WSL); fall back to
+            # pure-Python polling so the dashboard also runs on systems
+            # without coreutils (e.g. bare Windows Python).
+            tail = None
             try:
-                while True:
-                    ln = p.stdout.readline()
-                    if not ln: break
-                    self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
-                    self.wfile.flush()
+                tail = subprocess.Popen(["tail", "-n", "0", "-F", path],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError:
+                tail = None
+            try:
+                if tail is not None:
+                    while True:
+                        ln = tail.stdout.readline()
+                        if not ln: break
+                        self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
+                        self.wfile.flush()
+                else:
+                    # polling fallback: check file for new data twice a second
+                    f = open(path, "rb")
+                    f.seek(0, 2)
+                    while True:
+                        ln = f.readline()
+                        if not ln:
+                            time.sleep(0.5)
+                            continue
+                        self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
+                        self.wfile.flush()
             finally:
-                p.terminate()
+                if tail is not None: tail.terminate()
+                else: f.close()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
