@@ -101,7 +101,12 @@ async def probe(ip, sem):
             w.close()
             try: await w.wait_closed()
             except Exception: pass
-            return (ip, ms) if line.startswith(b"HTTP/") else None
+            # STRICT: only a real 2xx counts. 403 "error code: 1034" (Edge IP
+            # Restricted) means the edge refuses to proxy this zone — useless for VLESS.
+            parts = line.split()
+            ok = (len(parts) >= 2 and parts[0].startswith(b"HTTP/")
+                  and parts[1].isdigit() and 200 <= int(parts[1]) < 300)
+            return (ip, ms) if ok else None
         except Exception:
             return None
 
