@@ -15,6 +15,9 @@ def get_filename(base_name, ext="txt"):
     if not SECTION or SECTION.lower() in ("default", "main"):
         return os.path.join(BASE, f"{base_name}.{ext}")
     return os.path.join(BASE, f"{base_name}_{SECTION}.{ext}")
+# Non-Iranian IPs found by the IR scanner are re-routed to the EthernetServer
+# section (keeps IR strictly Iranian while still harvesting working relays).
+REDIRECT_SECTION = os.environ.get("REDIRECT_SECTION", "")
 
 WORKERS = int(os.environ.get("WORKERS", 8))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", 6))
@@ -32,6 +35,26 @@ VLESS_PATH = os.environ.get("CF_VLESS_PATH", "/").strip()
 def log(m):
     prefix = f"[{SECTION}] " if SECTION else ""
     print(time.strftime("%F %T"), f"{prefix}{m}", flush=True)
+
+def append_found(ip, ms, fpath=None):
+    """Append to a foundIPs file atomically-ish; drops any stray newline in ip."""
+    ip = ip.strip()
+    p = fpath or FOUND
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(f"{ip} {ms}\n")
+        f.flush()
+        os.fsync(f.fileno())   # power-loss safe: found IPs never lost
+
+def in_ranges(ip):
+    """True if ip belongs to any network in the section ranges file."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for n in nets():           # nets() caches nothing; fine for rare calls
+        if a in n:
+            return True
+    return False
 
 def _load(p):
     if os.path.exists(p):
@@ -151,15 +174,20 @@ async def run_cycle():
                 st = _load(STATE) or {}
                 hh = _load(HITS) or {}
                 now = time.time()
-                with open(FOUND, "a", encoding="utf-8") as f:
-                    for ip, ms in sorted(hits_now, key=lambda x: x[1]):
-                        f.write(f"{ip} {ms}\n")
-                        log(f"FOUND {ip} {ms}ms")
-                        st[ip] = {"ms": ms, "ts": now}
-                        s24 = str(ipaddress.ip_network(f"{ip}/24", strict=False))
-                        hh[s24] = hh.get(s24, 0) + 1
-                    f.flush()
-                    os.fsync(f.fileno())   # power-loss safe: found IPs never lost
+                redirected_path = None
+                if REDIRECT_SECTION:
+                    redirected_path = get_filename("foundedIPs", "txt").replace(
+                        f"_{SECTION}", f"_{REDIRECT_SECTION}")
+                for ip, ms in sorted(hits_now, key=lambda x: x[1]):
+                    route = FOUND
+                    if redirected_path and not in_ranges(ip):
+                        route = redirected_path
+                        log(f"FOUND-OUTSIDE {ip} {ms}ms -> redirected to {REDIRECT_SECTION}")
+                    append_found(ip, ms, route)
+                    log(f"FOUND {ip} {ms}ms")
+                    st[ip] = {"ms": ms, "ts": now}
+                    s24 = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+                    hh[s24] = hh.get(s24, 0) + 1
                 _save(STATE, st)
                 _save(HITS, hh)
             step = max(WORKERS * 25, 100)

@@ -1,0 +1,73 @@
+{
+  "global": {
+    "token": "REDACTED",
+    "zone": "REDACTED0195d1e476f474e048305d8f",
+    "domain": "e.REDACTED.ir"
+  },
+  "sections": {
+    "Iran": {
+      "records": "cn.REDACTEDwithdeepaffectionfortechnologyanditscience.ir,cn2.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 16,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 30,
+      "keeper_enabled": true
+    },
+    "Cloudflare_Official": {
+      "records": "cf.example.com,cf2.example.com",
+      "workers": 2,
+      "probe_timeout": 3,
+      "margin_ms": 20,
+      "check_interval_min": 30,
+      "keeper_enabled": false
+    },
+    "Hetzner": {
+      "records": "hz.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    },
+    "AmazonAWS": {
+      "records": "aws.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    },
+    "Aeza": {
+      "records": "aeza.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    },
+    "DigitalOcean": {
+      "records": "do.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    },
+    "EthernetServer": {
+      "records": "eth.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    },
+    "IONOS": {
+      "records": "ionos.REDACTEDwithdeepaffectionfortechnologyanditscience.ir",
+      "workers": 2,
+      "probe_timeout": 6,
+      "margin_ms": 30,
+      "check_interval_min": 60,
+      "keeper_enabled": true
+    }
+  }
+}
