@@ -95,6 +95,28 @@ enable/disable, foreground-service background scanning, live log.
 Set the app's battery setting to **Unrestricted** so scanning survives
 screen-off.
 
+## Geo-verification (IR section)
+
+The IR scanner runs `SECTION=Iran`, scanning ONLY `ranges_Iran.txt`
+(authoritative Iranian CIDR list). Two independent gates keep IR country-pure:
+
+1. **In-list check** — every find must belong to a range in `ranges_Iran.txt`
+   (also `ir_gate.txt`, the keeper's gate file).
+2. **Live country lookup** — every in-list find is additionally checked against
+   ip-api.com (no key, 45 req/min). IPs that geo-locate outside `GATE_COUNTRY`
+   (e.g. host-announced ranges like LeaseWeb NL that are in the list but
+   physically foreign) are **re-routed to the EthernetServer section**
+   (`foundedIPs_EthernetServer.txt` / `state_EthernetServer.json`) instead of
+   the IR pool — they still get harvested for the `eth.` record.
+3. **Keeper geo-gate** — `zima_keeper_pass.sh` runs the IR pass with
+   `GATE_COUNTRY=IR`, so the keeper's `gate()` requires BOTH the CIDR list AND
+   the live country; DNS for `cn.`/`cn2.` can only ever point at verified
+   Iranian IPs. If the geo API is unreachable, the keeper falls back to the
+   CIDR list (never locks out a working relay).
+
+EthernetServer stays a general pool: its own scanner feeds it, and the IR
+scanner's foreign sends join it.
+
 ## How "alive" is decided
 
 An IP counts only if:

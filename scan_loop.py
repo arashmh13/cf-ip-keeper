@@ -19,6 +19,33 @@ def get_filename(base_name, ext="txt"):
 # section (keeps IR strictly Iranian while still harvesting working relays).
 REDIRECT_SECTION = os.environ.get("REDIRECT_SECTION", "")
 
+import urllib.request, urllib.error
+# Real country verification for the IR section: the CIDR list alone is not
+# enough (host-announced ranges like LeaseWeb NL can be "in" an Iranian org's
+# list yet physically foreign). Uses ip-api.com batch (no key, 45 req/min).
+# GEO_COUNTRY=IR gates: only IPs whose live geo country == IR are kept in the
+# IR pool; everything else goes to REDIRECT_SECTION. Empty GEO_COUNTRY => off.
+GEO_COUNTRY = os.environ.get("GEO_COUNTRY", "").strip()
+_geo_cache = {}          # ip -> "IR"/"NL"/...  (or None when geo unavailable)
+
+def geo_country(ip):
+    """Live country code for one IP via ip-api.com batch/fallback-to-single.
+    Returns None when the lookup fails (caller decides fallback)."""
+    if ip in _geo_cache:
+        return _geo_cache[ip]
+    cc = None
+    try:
+        req = urllib.request.Request(
+            "http://ip-api.com/json/" + ip + "?fields=status,countryCode",
+            headers={"User-Agent": "curl/8.5"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            d = json.load(r)
+        cc = d.get("countryCode") if d.get("status") == "success" else None
+    except Exception:
+        cc = None
+    _geo_cache[ip] = cc
+    return cc
+
 WORKERS = int(os.environ.get("WORKERS", 8))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", 6))
 DOMAIN  = os.environ.get("CF_DOMAIN", "").strip()
@@ -188,6 +215,18 @@ async def run_cycle():
                     st[ip] = {"ms": ms, "ts": now}
                     s24 = str(ipaddress.ip_network(f"{ip}/24", strict=False))
                     hh[s24] = hh.get(s24, 0) + 1
+                # Geo-verification (only when a redirect section is configured):
+                # IPs that the CIDR list marks Iranian but that geo-locate abroad
+                # (host-announced ranges) go to the redirect section as well.
+                if redirected_path:
+                    for ip, ms in sorted(hits_now, key=lambda x: x[1]):
+                        if in_ranges(ip):
+                            cc = geo_country(ip)
+                            if cc is not None and cc != GEO_COUNTRY:
+                                # confirmed foreign: move out of the IR pool
+                                st.pop(ip, None)
+                                append_found(ip, ms, redirected_path)
+                                log(f"GEO-REJECT {ip} {ms}ms country={cc} -> redirected to {REDIRECT_SECTION}")
                 _save(STATE, st)
                 _save(HITS, hh)
             step = max(WORKERS * 25, 100)
