@@ -1,9 +1,6 @@
 """CF IP Keeper — live monitoring dashboard (zero dependencies, stdlib only).
-Serves on :8787 (override with DASH_PORT) — glass UI, SSE live logs,
-per-section control, EN/FA bilingual.
-Works on any Linux (Ubuntu/Debian/ZimaOS) and even bare Windows Python:
-- `tail -F` used for live streaming when available, pure-Python polling otherwise
-- systemctl controls degrade gracefully when sudo/systemd are unavailable
+Serves on :8787 — glass UI, SSE live logs, per-section control, EN/FA bilingual.
+Runs on ZimaOS from /DATA/cf-ip-keeper alongside the scanner services.
 """
 import json, os, re, subprocess, threading, time, html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,9 +15,18 @@ for s in SECTIONS[1:]:
     UNIT[s] = f"cf-ip-section@{s}.service"
 
 def fpath(section, base, ext):
-    if section == "Iran":
-        return os.path.join(BASE, f"{base}.{ext}")
-    return os.path.join(BASE, f"{base}_{section}.{ext}")
+    """Path for a section's file.
+
+    Iran ran as the DEFAULT section originally (legacy names: state.json,
+    dns_cache.json, ...) but scan_daemon.sh and zima_keeper_pass.sh now run it
+    with SECTION=Iran, so its live files are namespaced (state_Iran.json, ...).
+    Prefer the namespaced file when it exists, else fall back to the legacy one
+    — otherwise the UI shows stale values that disagree with the keeper.
+    """
+    ns = os.path.join(BASE, f"{base}_{section}.{ext}")
+    if section != "Iran":
+        return ns
+    return ns if os.path.exists(ns) else os.path.join(BASE, f"{base}.{ext}")
 
 def read_json(p):
     try:
@@ -75,23 +81,41 @@ def section_info(name):
         last_ts = d.get("ts")
     else:
         last_ts = None
-    # current DNS record IP from checker log
+    # per-record DNS state: dns_cache.json (authoritative, written by the keeper)
+    # with checker-log parsing as fallback for pre-cache history
+    recs0 = read_json(os.path.join(BASE, "sections_config.json")) or {}
+    cfg_records_str = ((recs0.get("sections") or {}).get(name, {}) or {}).get("records", "") or ""
+    cache = read_json(fpath(name, "dns_cache", "json")) or {}
+    loglines = tail_lines(fpath(name, "checker", "log"), 400)
     record_ip, record_ms = None, None
-    for ln in reversed(tail_lines(fpath(name, "checker", "log"), 400)):
-        m = re.search(r"switched \S+: \S+ \(\d+ms\) -> (\S+) \((\d+)ms\)", ln)
-        if m: record_ip, record_ms = m.group(1), int(m.group(2)); break
-        m = re.search(r"keeping \S+=(\S+) \((\d+)ms\)", ln)
-        if m: record_ip, record_ms = m.group(1), int(m.group(2)); break
-        m = re.search(r"created \S+ -> (\S+) \((\d+)ms\)", ln)
-        if m: record_ip, record_ms = m.group(1), int(m.group(2)); break
+    records = []
     recs = read_json(os.path.join(BASE, "sections_config.json")) or {}
+    for rn in [r.strip() for r in (cfg_records_str).split(",") if r.strip()]:
+        rip, rms = None, None
+        c = cache.get(rn) or {}
+        if c.get("ip"):
+            rip, rms = c.get("ip"), c.get("ms")
+        else:
+            for ln in reversed(loglines):
+                m = re.search(rf"keeping {re.escape(rn)}=(\S+) \((\d+)ms\)", ln)
+                if m: rip, rms = m.group(1), int(m.group(2)); break
+                m = re.search(rf"switched {re.escape(rn)}:.*-> (\S+) \((\d+)ms\)", ln)
+                if m: rip, rms = m.group(1), int(m.group(2)); break
+                m = re.search(rf"created {re.escape(rn)} -> (\S+) \((\d+)ms\)", ln)
+                if m: rip, rms = m.group(1), int(m.group(2)); break
+        if rip and rms is None:
+            rms = (state.get(rip) or {}).get("ms")
+        if rip and record_ip is None:
+            record_ip, record_ms = rip, rms
+        records.append({"label": rn.split(".")[0], "ip": rip, "ms": rms})
+    cfg = (recs.get("sections") or {}).get(name, {})
     cfg = (recs.get("sections") or {}).get(name, {})
     return {"name": name, "unit": UNIT[name], "active": active, "since": since,
             "cursor_i": cur.get("i", 0), "cursor_j": cur.get("j", 0), "nets": nranges,
             "found": len(state), "hits_total": sum(hits.values()), "hot_nets": len(hits),
             "last_found": last_found, "last_ms": last_ms, "last_ts": last_ts,
-            "record_ip": record_ip, "record_ms": record_ms,
-            "workers": cfg.get("workers"), "records": cfg.get("records", "")}
+            "record_ip": record_ip, "record_ms": record_ms, "records": records,
+            "workers": cfg.get("workers")}
 
 def api_status():
     secs = [section_info(s) for s in SECTIONS]
@@ -121,9 +145,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, f.read(), "text/html; charset=utf-8")
         elif u.path == "/api/status":
             self._send(200, json.dumps(api_status()).encode())
-        elif u.path == "/icon.svg":
+        elif u.path.endswith(".svg") and u.path.count("/") == 1:
             try:
-                with open(os.path.join(BASE, "icon.svg"), "rb") as f:
+                nm = os.path.basename(u.path)
+                with open(os.path.join(BASE, nm), "rb") as f:
                     self._send(200, f.read(), "image/svg+xml")
             except Exception:
                 self._send(404, b"{}")
@@ -154,8 +179,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, b'{"error":"bad action"}')
         if action == "check": action = "start"
         out = sh("sudo", "-n", "systemctl", action, unit)
-        ok = sh("sudo", "-n", "systemctl", "is-active", unit)
-        self._send(200, json.dumps({"ok": ok == "active", "state": ok or "unavailable", "out": out}).encode())
+        ok = subprocess.run(["sudo", "-n", "systemctl", "is-active", unit],
+                            capture_output=True, text=True).stdout.strip()
+        self._send(200, json.dumps({"ok": ok == "active", "state": ok, "out": out}).encode())
 
     def stream_sse(self, q):
         name = (q.get("file") or ["scanner.log"])[0]
@@ -171,36 +197,16 @@ class Handler(BaseHTTPRequestHandler):
             for ln in tail_lines(path, 150):
                 self.wfile.write(f"data: {json.dumps(ln)}\n\n".encode())
             self.wfile.flush()
-            # prefer `tail -F` when available (Linux/macOS/WSL); fall back to
-            # pure-Python polling so the dashboard also runs on systems
-            # without coreutils (e.g. bare Windows Python).
-            tail = None
+            p = subprocess.Popen(["tail", "-n", "0", "-F", path],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
-                tail = subprocess.Popen(["tail", "-n", "0", "-F", path],
-                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            except OSError:
-                tail = None
-            try:
-                if tail is not None:
-                    while True:
-                        ln = tail.stdout.readline()
-                        if not ln: break
-                        self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
-                        self.wfile.flush()
-                else:
-                    # polling fallback: check file for new data twice a second
-                    f = open(path, "rb")
-                    f.seek(0, 2)
-                    while True:
-                        ln = f.readline()
-                        if not ln:
-                            time.sleep(0.5)
-                            continue
-                        self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
-                        self.wfile.flush()
+                while True:
+                    ln = p.stdout.readline()
+                    if not ln: break
+                    self.wfile.write(f"data: {json.dumps(ln.decode('utf-8', 'replace'))}\n\n".encode())
+                    self.wfile.flush()
             finally:
-                if tail is not None: tail.terminate()
-                else: f.close()
+                p.terminate()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 

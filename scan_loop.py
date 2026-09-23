@@ -26,10 +26,14 @@ import urllib.request, urllib.error
 # GEO_COUNTRY=IR gates: only IPs whose live geo country == IR are kept in the
 # IR pool; everything else goes to REDIRECT_SECTION. Empty GEO_COUNTRY => off.
 GEO_COUNTRY = os.environ.get("GEO_COUNTRY", "").strip()
+# The geo lookup must be able to resolve DNS: on this box direct lookups fail
+# ("Temporary failure in name resolution"), so route them through the local
+# proxy when one is configured. Without this the geo layer silently no-ops.
+GEO_PROXY = os.environ.get("GEO_PROXY", os.environ.get("CF_API_PROXY", "")).strip()
 _geo_cache = {}          # ip -> "IR"/"NL"/...  (or None when geo unavailable)
 
 def geo_country(ip):
-    """Live country code for one IP via ip-api.com batch/fallback-to-single.
+    """Live country code for one IP via ip-api.com (proxy-aware).
     Returns None when the lookup fails (caller decides fallback)."""
     if ip in _geo_cache:
         return _geo_cache[ip]
@@ -38,8 +42,14 @@ def geo_country(ip):
         req = urllib.request.Request(
             "http://ip-api.com/json/" + ip + "?fields=status,countryCode",
             headers={"User-Agent": "curl/8.5"})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            d = json.load(r)
+        if GEO_PROXY:
+            _op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": GEO_PROXY, "https": GEO_PROXY}))
+            with _op.open(req, timeout=8) as r:
+                d = json.load(r)
+        else:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.load(r)
         cc = d.get("countryCode") if d.get("status") == "success" else None
     except Exception:
         cc = None
@@ -92,16 +102,36 @@ def _load(p):
     return None
 
 def _save(p, d):
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f)
-        f.flush()
-        os.fsync(f.fileno())          # power-loss safe: data reaches disk
-    os.replace(tmp, p)
-    # fsync the directory so the rename itself survives power loss
-    dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
-    try: os.fsync(dfd)
-    finally: os.close(dfd)
+    # Serialize with the keeper (which uses the SAME <file>.lock) so a
+    # keeper read-modify-write of state_Iran.json can never clobber a scanner
+    # find, or vice versa — that race could resurrect a purged/foreign IP.
+    try:
+        import fcntl
+    except Exception:
+        fcntl = None
+    fh = None
+    if fcntl:
+        try:
+            fh = open(p + ".lock", "w")
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        except Exception:
+            fh = None
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())          # power-loss safe: data reaches disk
+        os.replace(tmp, p)
+        # fsync the directory so the rename itself survives power loss
+        dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        if fh:
+            try: fcntl.flock(fh, fcntl.LOCK_UN)
+            except Exception: pass
+            fh.close()
 
 def nets():
     rpath = RANGES
@@ -207,26 +237,29 @@ async def run_cycle():
                         f"_{SECTION}", f"_{REDIRECT_SECTION}")
                 for ip, ms in sorted(hits_now, key=lambda x: x[1]):
                     route = FOUND
+                    tag = f"FOUND {ip} {ms}ms"
                     if redirected_path and not in_ranges(ip):
                         route = redirected_path
-                        log(f"FOUND-OUTSIDE {ip} {ms}ms -> redirected to {REDIRECT_SECTION}")
+                        tag = f"FOUND-OUTSIDE {ip} {ms}ms -> redirected to {REDIRECT_SECTION}"
+                    elif redirected_path and GEO_COUNTRY and in_ranges(ip):
+                        # In the CIDR list but the live country disagrees (host-
+                        # announced ranges). Verify BEFORE adding to the IR pool so
+                        # it never enters state[_Iran] in the first place.
+                        cc = geo_country(ip)
+                        if cc is not None and cc != GEO_COUNTRY:
+                            route = redirected_path
+                            tag = (f"GEO-REJECT {ip} {ms}ms country={cc} "
+                                   f"-> redirected to {REDIRECT_SECTION}")
+                    # exactly one destination per find: never append the same IP to
+                    # both the IR pool and the redirect pool
                     append_found(ip, ms, route)
-                    log(f"FOUND {ip} {ms}ms")
-                    st[ip] = {"ms": ms, "ts": now}
+                    log(tag)
+                    if route is not redirected_path:
+                        st[ip] = {"ms": ms, "ts": now}
+                    else:
+                        st.pop(ip, None)
                     s24 = str(ipaddress.ip_network(f"{ip}/24", strict=False))
                     hh[s24] = hh.get(s24, 0) + 1
-                # Geo-verification (only when a redirect section is configured):
-                # IPs that the CIDR list marks Iranian but that geo-locate abroad
-                # (host-announced ranges) go to the redirect section as well.
-                if redirected_path:
-                    for ip, ms in sorted(hits_now, key=lambda x: x[1]):
-                        if in_ranges(ip):
-                            cc = geo_country(ip)
-                            if cc is not None and cc != GEO_COUNTRY:
-                                # confirmed foreign: move out of the IR pool
-                                st.pop(ip, None)
-                                append_found(ip, ms, redirected_path)
-                                log(f"GEO-REJECT {ip} {ms}ms country={cc} -> redirected to {REDIRECT_SECTION}")
                 _save(STATE, st)
                 _save(HITS, hh)
             step = max(WORKERS * 25, 100)
