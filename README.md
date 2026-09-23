@@ -111,11 +111,52 @@ The IR scanner runs `SECTION=Iran`, scanning ONLY `ranges_Iran.txt`
 3. **Keeper geo-gate** — `zima_keeper_pass.sh` runs the IR pass with
    `GATE_COUNTRY=IR`, so the keeper's `gate()` requires BOTH the CIDR list AND
    the live country; DNS for `cn.`/`cn2.` can only ever point at verified
-   Iranian IPs. If the geo API is unreachable, the keeper falls back to the
-   CIDR list (never locks out a working relay).
+   Iranian IPs. Run with `GEO_STRICT=1` to fail closed when the country cannot
+   be resolved (never trust the CIDR list alone). Verified countries are cached
+   in `geo_cache_<section>.json`, so a geo-API outage does not disable the gate.
+   **On hosts whose DNS resolution fails** (common on tightly-firewalled boxes)
+   ip-api.com cannot be reached directly — set `GEO_PROXY` (e.g.
+   `http://127.0.0.1:20171`) or the lookup returns nothing and the gate no-ops.
 
 EthernetServer stays a general pool: its own scanner feeds it, and the IR
 scanner's foreign sends join it.
+
+## The cn != cn2 invariant
+
+A section's records must **never** share an IP. `cn.` and `cn2.` are the same
+section, so they are the case that matters. The keeper enforces this in a pure,
+unit-tested decision core (`plan_records()`):
+
+* an IP currently owned by a sibling record can **never** be offered to another
+  record in the same section;
+* a record already sharing an IP with a sibling is **forced to move**, even when
+  the shared IP is the fastest one available (the rule beats latency);
+* if nothing else is alive, the record is reported `unresolved` and the keeper
+  probes more candidates instead of silently keeping the duplicate;
+* the decision is based on **live DNS read from the Cloudflare API**, never on
+  the local `dns_cache` (a stale or self-contradictory cache is exactly how the
+  original duplicate became self-perpetuating);
+* if a record cannot be read, the pass writes **nothing** (a blind `POST` would
+  create a duplicate record);
+* the keeper also avoids IPs held by records it does not manage (e.g. a `cam.`
+  record owned by another system), so the zone never gets an accidental
+  collision.
+
+Regression tests (no network or credentials needed):
+
+```bash
+python test_plan_records.py     # unit + 4000-case fuzz, asserts zero duplicates
+python repro_cn_dup.py          # reproduces the original bug, shows the fix
+```
+
+Full end-to-end test against a mock Cloudflare API (`e2e_keeper_test.py`)
+covers: repairing an existing duplicate, idempotence across passes, an API
+outage (no writes), a geo outage with `GEO_STRICT=1`, and a cross-system
+collision. Run it in WSL/Linux:
+
+```bash
+python3 e2e_keeper_test.py
+```
 
 ## How "alive" is decided
 
